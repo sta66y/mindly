@@ -4,10 +4,10 @@ WORKDIR /app
 
 RUN pip install uv --no-cache-dir
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 COPY src/ ./src/
 
-RUN uv sync --no-dev
+RUN uv sync --no-dev --frozen
 
 COPY scripts/ ./scripts/
 

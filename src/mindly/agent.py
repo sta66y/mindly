@@ -102,16 +102,29 @@ class MindlyAgent:
         messages: list[dict],
         t_start: float,
     ) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=False,
-        )
-        text = resp.choices[0].message.content or ""
-        ttft = time.perf_counter() - t_start
-        logger.info(f"chat.generate user={user_id} TTFT={ttft:.3f}s tokens={len(text.split())}")
-        self._post_turn(user_id, message, text)
-        return text
+        for attempt in range(3):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=False,
+                )
+                text = resp.choices[0].message.content or ""
+                ttft = time.perf_counter() - t_start
+                logger.info(f"chat.generate user={user_id} TTFT={ttft:.3f}s tokens={len(text.split())}")
+                self._post_turn(user_id, message, text)
+                return text
+            except Exception as exc:
+                msg = str(exc)
+                if "429" in msg and "per-day" in msg:
+                    raise
+                if "429" in msg:
+                    wait = 60 * (attempt + 1)
+                    logger.warning(f"rate_limit chat user={user_id}: ждём {wait}s")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise RuntimeError("rate limit: все попытки исчерпаны")
 
     def _stream(
         self,
@@ -171,29 +184,40 @@ class MindlyAgent:
         )
         prompt = _FACT_EXTRACTION_PROMPT.format(conversation=conversation_text)
 
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                stream=False,
-            )
-            raw = (resp.choices[0].message.content or "").strip()
-
-            if raw.startswith("```"):
-                lines = raw.splitlines()
-                raw = "\n".join(
-                    lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        for attempt in range(3):
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    stream=False,
                 )
+                raw = (resp.choices[0].message.content or "").strip()
 
-            facts = json.loads(raw)
-            if not isinstance(facts, list):
+                if raw.startswith("```"):
+                    lines = raw.splitlines()
+                    raw = "\n".join(
+                        lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+                    )
+
+                facts = json.loads(raw)
+                if not isinstance(facts, list):
+                    return []
+                logger.debug(f"facts_extracted user={user_id} count={len(facts)}")
+                return facts
+            except Exception as exc:
+                msg = str(exc)
+                if "429" in msg and "per-day" in msg:
+                    logger.warning(f"rate_limit_daily user={user_id}: суточный лимит исчерпан, пропускаем")
+                    return []
+                if "429" in msg:
+                    wait = 60 * (attempt + 1)
+                    logger.warning(f"rate_limit user={user_id}: ждём {wait}s (попытка {attempt+1}/3)")
+                    time.sleep(wait)
+                    continue
+                logger.error(f"fact_extraction_failed user={user_id}: {exc}")
                 return []
-            logger.debug(f"facts_extracted user={user_id} count={len(facts)}")
-            return facts
-        except Exception as exc:
-            logger.error(f"fact_extraction_failed user={user_id}: {exc}")
-            return []
+        return []
 
     def _build_system_prompt(self, persona: str, memories: list[dict]) -> str:
         base = PERSONAS.get(persona, PERSONAS["wellness_friend"])["system_prompt"]

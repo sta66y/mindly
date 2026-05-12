@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import random
 import time
 from typing import Optional
 
@@ -9,8 +11,36 @@ from loguru import logger
 from ..agent import MindlyAgent
 
 
-def _substring_score(expected: str, predicted: str) -> float:
-    return 1.0 if expected.strip().lower() in predicted.strip().lower() else 0.0
+def _load_longmemeval(split: str = "oracle") -> list[dict]:
+    """Download LongMemEval and return as a plain Python list.
+
+    The HF repo stores files without extension and with nested structures that
+    cause type-inference failures in Dataset.from_list — so we skip that and
+    return the raw list directly.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("Установи huggingface_hub: uv add huggingface_hub")
+
+    filename = f"longmemeval_{split}"
+    logger.info(f"Скачиваю {filename} через hf_hub_download")
+    local_path = hf_hub_download(
+        repo_id="xiaowu0162/longmemeval",
+        filename=filename,
+        repo_type="dataset",
+    )
+    with open(local_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict):
+        data = next(iter(data.values())) if len(data) == 1 else list(data.values())[0]
+
+    return data
+
+
+def _substring_score(expected, predicted) -> float:
+    return 1.0 if str(expected).strip().lower() in str(predicted).strip().lower() else 0.0
 
 
 def run_longmemeval(
@@ -20,11 +50,6 @@ def run_longmemeval(
     wandb_project: Optional[str] = None,
     seed: int = 42,
 ) -> dict:
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        raise RuntimeError("Установи datasets: uv add datasets")
-
     run = None
     if wandb_project:
         try:
@@ -46,14 +71,12 @@ def run_longmemeval(
             logger.warning(f"W&B не запустился, продолжаю без него: {exc}")
 
     logger.info(f"Загружаю LongMemEval split={split}")
-    dataset = load_dataset("xiaowu0162/longmemeval", split=split, trust_remote_code=True)
+    dataset = _load_longmemeval(split)
 
-    import random
     rng = random.Random(seed)
     indices = list(range(len(dataset)))
     rng.shuffle(indices)
-    indices = indices[:n_samples]
-    subset = dataset.select(indices)
+    subset = [dataset[i] for i in indices[:n_samples]]
 
     correct = 0
     total = 0
@@ -62,23 +85,40 @@ def run_longmemeval(
 
     for i, item in enumerate(subset):
         eval_uid = f"__eval_{i}_{int(time.time())}"
-        sessions = item.get("sessions", [])
+
+        # The dataset field is 'haystack_sessions', each session is a list of turns.
+        # Turns may include a 'has_answer' key — strip it before passing to the agent.
+        sessions = item.get("haystack_sessions", [])
         question = item.get("question", "")
         answer = item.get("answer", "")
         qtype = item.get("question_type", "unknown")
 
         for session in sessions:
             if session:
-                agent.ingest_conversation(eval_uid, session)
+                clean_turns = [
+                    {"role": t["role"], "content": t["content"]}
+                    for t in session
+                    if isinstance(t, dict) and "role" in t and "content" in t
+                ]
+                if clean_turns:
+                    agent.ingest_conversation(eval_uid, clean_turns)
         agent.flush_background(timeout=60.0)
 
+        daily_limit_hit = False
         try:
             response = agent.chat(eval_uid, "wellness_friend", question, stream=False)
         except Exception as exc:
-            logger.error(f"bench item {i} ошибка: {exc}")
+            msg = str(exc)
+            if "429" in msg and "per-day" in msg:
+                logger.warning("Суточный лимит OpenRouter исчерпан — останавливаем бенчмарк досрочно")
+                agent.forget(eval_uid, "all")
+                daily_limit_hit = True
+            else:
+                logger.error(f"bench item {i} ошибка: {exc}")
             response = ""
 
-        score = _substring_score(answer, response)
+        answer_str = str(answer)
+        score = _substring_score(answer_str, response)
         correct += int(score)
         total += 1
         by_type.setdefault(qtype, []).append(score)
@@ -86,15 +126,19 @@ def run_longmemeval(
         rows.append({
             "idx": i,
             "type": qtype,
-            "question": question[:80],
-            "expected": answer[:80],
+            "question": str(question)[:80],
+            "expected": answer_str[:80],
             "got": response[:120],
             "score": score,
         })
 
         logger.info(f"bench [{i+1}/{len(subset)}] type={qtype} score={score:.0f}")
-
         agent.forget(eval_uid, "all")
+
+        if daily_limit_hit:
+            break
+
+        logger.info(f"bench [{i+1}/{len(subset)}] type={qtype} score={score:.0f}")
 
     accuracy = correct / total if total else 0.0
     by_type_agg = {k: sum(v) / len(v) for k, v in by_type.items()}
