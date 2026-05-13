@@ -1,109 +1,84 @@
-# Mindly — AI Wellness Coach with Persistent Memory
+# Mindly — велнес-коуч с памятью
 
-**Имя:** Иванов Иван Иванович  
-**Группа:** DS-XX
-
----
-
-## Содержание
-
-- [Описание](#описание)
-- [Архитектура памяти](#архитектура-памяти)
-- [Как запустить](#как-запустить)
-- [Персоны](#персоны)
-- [Управление памятью и изоляция](#управление-памятью-и-изоляция)
-- [Бенчмарк](#бенчмарк)
-- [Модели и датасеты](#модели-и-датасеты)
-- [Design Doc](#design-doc)
+**Гультяев Илья, Захарова Ксения** · Группа 972403
 
 ---
 
-## Описание
+Это третье домашнее задание по NLP (экспериментальный трек). Задача — построить разговорного агента, который реально помнит пользователя между сессиями, а не делает вид.
 
-Mindly — conversational AI wellness-коуч с долгосрочной персистентной памятью. Агент помнит цели, прогресс, имена близких и чувствительные темы клиента **между сессиями** (после перезапуска процесса). Реализованы:
+Мы сделали CLI-коуча на трёх персонах. Закрыл терминал, открыл снова — агент помнит, что ты рассказывал про сына-девятиклассника или про первую пробежку. Память хранится в ChromaDB + SQLite на диске.
 
-- Persistent memory (ChromaDB + SQLite)
-- 3 персоны с общей памятью
-- Tenant-изоляция: данные клиента A недоступны клиенту B
-- Целевое и полное забывание (152-ФЗ / right-to-forget)
-- Стриминг с TTFT < 1.5 с
-- LongMemEval benchmark + W&B логирование
+---
+
+## Что внутри
+
+- Персистентная память между сессиями (ChromaDB + SQLite)
+- Три персоны с общей памятью клиента
+- Изоляция пользователей — данные Алисы не утекут к Бобу
+- Команды `/forget` — точечное и полное удаление памяти
+- Стриминг токенов
+- LongMemEval бенчмарк + логирование в W&B
 
 ---
 
 ## Архитектура памяти
 
-Выбрана **hand-rolled** архитектура на базе ChromaDB + SQLite — в пользу прозрачности кода и явной tenant-изоляции (вместо managed-фреймворков типа mem0 или Letta).
-
-**Поток данных:**
+Выбрали hand-rolled подход на ChromaDB + SQLite вместо готовых фреймворков типа mem0 или Letta. Главная причина — прозрачность и явный контроль над изоляцией.
 
 ```
-User message
-    │
-    ▼
-MemoryLayer.retrieve(user_id, query, k=7)   ← ChromaDB WHERE user_id=X
-    │
-    ▼
-Prompt Builder  (persona base + memory block + session history)
-    │
-    ▼
-LLM (OpenRouter)  → streaming tokens → User
-    │
-    ▼ (background thread)
-Fact Extractor (LLM, temp=0, JSON) → MemoryLayer.store(user_id, facts)
-    │
-    ├── ChromaDB.upsert(facts, metadata={user_id, category, do_not_raise})
-    └── SQLite INSERT (audit log)
+Сообщение пользователя
+        │
+        ▼
+ChromaDB.query(where user_id=X, k=7)   ← достаём релевантные факты
+        │
+        ▼
+Собираем промпт: персона + факты + история сессии
+        │
+        ▼
+LLM (OpenRouter) → стриминг токенов → пользователь
+        │
+        ▼  (в фоновом треде)
+Экстрактор фактов (LLM, temp=0, JSON)
+        │
+        ├── ChromaDB.upsert(факты, {user_id, category, do_not_raise})
+        └── SQLite INSERT (аудит-лог)
 ```
 
-**Tenant-изоляция:** каждый `retrieve()` и `delete()` передаёт `where={"user_id": user_id}` в ChromaDB — фильтр применяется до формирования результата. Утечка невозможна на уровне хранилища.
-
-**Do-not-raise:** факты с флагом `do_not_raise=True` хранятся отдельным блоком в системном промпте с явным запретом поднимать их по инициативе агента.
-
-**Персистентность:** ChromaDB `PersistentClient` и SQLite хранятся на диске (`./data/memory/`). Перезапуск процесса не теряет память.
+Изоляция реализована на уровне ChromaDB: каждый `retrieve()` и `delete()` передаёт `where={"user_id": user_id}`. Факты с флагом `do_not_raise=True` агент хранит, но никогда не поднимает первым — только если клиент сам заговорит.
 
 ---
 
 ## Как запустить
 
-### Через uv (рекомендуется)
+### Локально (uv)
 
 ```bash
-# 1. Установить uv
-pip install uv
-
-# 2. Клонировать и перейти в директорию
 git clone <repo-url>
 cd mindly
 
-# 3. Создать .env из примера
-cp .env .env
-# Вписать OPENROUTER_API_KEY=sk-or-...
+# Создать .env и вписать ключ
+cp .env.example .env
+# OPENROUTER_API_KEY=sk-or-...
 
-# 4. Установить зависимости
 uv sync
-
-# 5. Запустить чат
 uv run mindly chat --user alice --persona wellness_friend
 ```
 
-### Через Docker
+### Docker
 
 ```bash
-cp .env .env
-# Вписать OPENROUTER_API_KEY
-
+cp .env.example .env
 docker-compose build
 docker-compose run --rm mindly chat --user alice --persona wellness_friend
 ```
 
 ### Команды в чате
 
-| Команда | Действие |
-|---------|---------|
+| Команда | Что делает |
+|---------|-----------|
 | `/forget <тема>` | Удалить воспоминания по теме |
-| `/forget all` | Удалить все воспоминания |
-| `/persona <имя>` | Переключить персону |
+| `/forget all` | Стереть всё |
+| `/persona <имя>` | Сменить персону |
 | `/memories` | Показать все сохранённые факты |
 | `/quit` | Выйти |
 
@@ -111,62 +86,54 @@ docker-compose run --rm mindly chat --user alice --persona wellness_friend
 
 ## Персоны
 
-| Ключ | Имя | Описание |
-|------|-----|---------|
-| `tough_love` | Drill Sergeant | Прямой, военный стиль, высокие ожидания |
-| `wellness_friend` | Wellness Friend | Тёплый, эмпатичный, поддерживающий |
-| `cbt_coach` | CBT Coach | Структурированный, КПТ-метод, Сократовы вопросы |
+Три персоны, одна база памяти. Можно переключаться между сессиями — агент всё помнит независимо от того, какая персона активна.
 
-**Смена персоны сохраняет память:** факты клиента хранятся в общем ChromaDB-хранилище, независимо от персоны.
+| Ключ | Имя | Стиль |
+|------|-----|-------|
+| `tough_love` | Drill Sergeant | Жёсткий, прямой, без сюсюканья |
+| `wellness_friend` | Wellness Friend | Тёплый, как хороший друг |
+| `cbt_coach` | CBT Coach | Структурированный, сократовы вопросы |
 
 ```bash
-# Начать с wellness_friend
+# Сначала поговорили с wellness_friend
 uv run mindly chat --user alice --persona wellness_friend
 
-# В новой сессии переключиться на tough_love
+# Потом переключились — агент помнит всё из прошлой сессии
 uv run mindly chat --user alice --persona tough_love
-# Агент знает всё из предыдущей сессии
 ```
 
 ---
 
-## Управление памятью и изоляция
+## Управление памятью
 
-### Целевое забывание
+### Удалить конкретную тему
 
 ```bash
 # В чате:
 /forget моя работа
 
-# Или через CLI:
+# Из терминала:
 uv run mindly forget --user alice "моя работа"
 ```
 
-### Полное удаление (152-ФЗ / right-to-forget)
+### Удалить всё (152-ФЗ / right-to-forget)
 
 ```bash
-# В чате:
 /forget all
-
-# Или через CLI:
+# или
 uv run mindly forget --user alice all
 ```
 
-### Демонстрация tenant-изоляции
+### Проверить изоляцию между пользователями
 
 ```bash
 uv run python scripts/demo_isolation.py
 ```
 
-Скрипт:
-1. Создаёт пользователя `alice`, передаёт личные факты.
-2. Создаёт пользователя `bob`, спрашивает «что ты обо мне знаешь?».
-3. Проверяет, что `alice` данных нет в ни ответе, ни в памяти Bob.
-4. Выводит `✅ Tenant isolation: PASSED`.
-
-### Автотесты изоляции
+Скрипт создаёт Алису, она что-то рассказывает. Потом создаётся Боб и спрашивает «что ты обо мне знаешь?». Проверяем, что факты Алисы не попали ни в ответ, ни в память Боба. Должно выйти `✅ Tenant isolation: PASSED`.
 
 ```bash
+# Автотесты
 uv run pytest tests/test_isolation.py -v
 uv run pytest tests/test_memory.py -v
 ```
@@ -175,64 +142,60 @@ uv run pytest tests/test_memory.py -v
 
 ## Бенчмарк
 
-**Выбор: LongMemEval** (Wu et al., 2024) — arxiv.org/abs/2410.10813
+Выбрали **LongMemEval** (Wu et al., 2024) — [arxiv.org/abs/2410.10813](https://arxiv.org/abs/2410.10813).
 
-**Почему LongMemEval:**
-- Охватывает 5 типов вопросов о долгосрочной памяти: single-session, multi-session, temporal reasoning, knowledge updating, negation.
-- Синтетические сессии близки к формату коучинг-диалогов (факты о жизни пользователя).
-- Датасет публично доступен, воспроизводим.
-
-**Запуск бенчмарка:**
+Почему он: охватывает пять типов вопросов о долгосрочной памяти, синтетические диалоги близки к нашему формату, датасет открытый и воспроизводимый.
 
 ```bash
-# Без W&B
-uv run python scripts/run_eval.py --n 100
-
-# С логированием в W&B
-uv run python scripts/run_eval.py --n 100 --wandb
+uv run python scripts/run_eval.py --n 50 --wandb
 ```
 
-**Результат:** *[заполняется после запуска]*
+**Результаты (n=12, oracle split):**
 
 | Метрика | Значение |
 |---------|---------|
-| Accuracy (substring match, n=100) | **TBD** |
-| Baseline (без памяти) | ~30–35% |
-| TTFT p50 | **TBD** |
+| Accuracy (substring match) | **0.50** (6/12) |
+| Baseline без памяти | ~0.30–0.35 |
+| TTFT p50 | ~22 с (free tier OpenRouter) |
 
-**Почему эта цифра допустима для демо:**
-Бенчмарк тестирует архитектуру на синтетических данных (английский, чистые диалоги). Реальный корпус Mindly — билингвальный и зашумлённый, что делает задачу сложнее. Главный аргумент для инвестора — не абсолютная цифра, а:
-1. Наша система **значительно превышает baseline** (нет памяти).
-2. Recall-момент на живом демо работает стабильно.
-3. Архитектура масштабируема и расширяема (улучшенный retrieval, fine-tuning факт-экстрактора в v2).
+Разбивка по типам:
 
-Для улучшения accuracy: (a) перейти на более сильную модель (GPT-4o, Claude Sonnet), (b) использовать реранкинг retrieved фактов, (c) добавить temporal reasoning в промпт-экстракцию.
+| Тип вопроса | Правильно | Всего | Accuracy |
+|-------------|-----------|-------|---------|
+| knowledge-update | 2 | 2 | 1.00 |
+| single-session-user | 2 | 2 | 1.00 |
+| multi-session | 1 | 2 | 0.50 |
+| temporal-reasoning | 1 | 5 | 0.20 |
+| single-session-preference | 0 | 1 | 0.00 |
+
+**Почему n=12.** OpenRouter free tier — 50 запросов/день, каждый item бенчмарка требует ~4 вызова (экстракция фактов по сессиям + финальный вопрос). Прогнали сколько успели за два дня, но это не заглушка — система реально загружала память и отвечала на вопросы.
+
+**Про цифру 0.50.** Это в 1.5 раза лучше baseline (нет памяти). Лучше всего работает на `knowledge-update` и `single-session-user` — агент уверенно вспоминает конкретные факты о клиенте. Хуже всего на `temporal-reasoning` (0.20) — модель путает когда именно что-то произошло. Это ожидаемо для бесплатной модели без явного хранения timestamp'ов. В v2 это лечится: хранить дату факта в метаданных ChromaDB и передавать в промпт.
+
+Результаты в W&B: [sta66y-tomsk-state-university/mindly-eval](https://wandb.ai/sta66y-tomsk-state-university/mindly-eval)
 
 ---
 
 ## Модели и датасеты
 
-| Компонент | Название | Лицензия |
-|-----------|---------|---------|
-| LLM (inference) | qwen/qwen3-30b-a3b-instruct:free via OpenRouter | Apache 2.0 (Qwen) |
-| Fallback LLM | meta-llama/llama-3.1-8b-instruct:free | Llama Community License |
-| Embeddings | sentence-transformers/all-MiniLM-L6-v2 | Apache 2.0 |
+| Компонент | Что используем | Лицензия |
+|-----------|---------------|---------|
+| LLM | qwen/qwen3-30b-a3b-instruct:free (OpenRouter) | Apache 2.0 |
+| Fallback | meta-llama/llama-3.1-8b-instruct:free | Llama Community |
+| Эмбеддинги | sentence-transformers/all-MiniLM-L6-v2 | Apache 2.0 |
 | Vector store | ChromaDB | Apache 2.0 |
-| Benchmark | LongMemEval (xiaowu0162/longmemeval) | MIT |
+| Бенчмарк | LongMemEval (xiaowu0162/longmemeval) | MIT |
 
 ---
 
 ## Design Doc
 
-Документ находится в [`docs/ml_system_design_doc.md`](docs/ml_system_design_doc.md).
+[docs/ml_system_design_doc.md](docs/ml_system_design_doc.md)
 
 ---
 
-## Demo
+## Демо
 
-*[Здесь должен быть GIF/видео с двумя кросс-сессионными разговорами демонстрирующий recall]*
+*[GIF с двумя кросс-сессионными разговорами — в процессе]*
 
-**Сценарий:**
-1. Сессия 1: пользователь рассказывает про сына-девятиклассника и экзамены.
-2. Процесс завершён (`Ctrl+C`).
-3. Сессия 2: пользователь пишет «Привет» — агент сам спрашивает про экзамены.
+Сценарий: в первой сессии пользователь упоминает сына-девятиклассника и экзамены. Сессия завершается. Во второй сессии пишет «Привет» — агент сам спрашивает про экзамены.
